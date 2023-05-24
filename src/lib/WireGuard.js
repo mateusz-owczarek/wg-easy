@@ -111,7 +111,7 @@ PostDown = ${WG_POST_DOWN}
 [Peer]
 PublicKey = ${client.publicKey}
 PresharedKey = ${client.preSharedKey}
-AllowedIPs = ${client.address}/32`;
+AllowedIPs = ${client.allowedIps}`;
     }
 
     debug('Config saving...');
@@ -136,11 +136,10 @@ AllowedIPs = ${client.address}/32`;
       id: clientId,
       name: client.name,
       enabled: client.enabled,
-      address: client.address,
       publicKey: client.publicKey,
       createdAt: new Date(client.createdAt),
       updatedAt: new Date(client.updatedAt),
-      allowedIPs: client.allowedIPs,
+      allowedIps: client.allowedIps,
 
       persistentKeepalive: null,
       latestHandshakeAt: null,
@@ -196,10 +195,20 @@ AllowedIPs = ${client.address}/32`;
     const config = await this.getConfig();
     const client = await this.getClient({ clientId });
 
+    if (client.allowedIps.length === 0) {
+      throw new ServerError(`Client needs to have at least one Allowed IP`, 404);
+    }
+
+    const address = this.getInterfaceAddress(client.allowedIps);
+
+    if (!address) {
+      throw new ServerError('Client needs to have at least one Allowed IP in the server\'s virtual subnet');
+    }
+
     return `
 [Interface]
 PrivateKey = ${client.privateKey}
-Address = ${client.address}/24
+Address = ${address}/24
 ${WG_DEFAULT_DNS ? `DNS = ${WG_DEFAULT_DNS}` : ''}
 ${WG_MTU ? `MTU = ${WG_MTU}` : ''}
 
@@ -219,7 +228,7 @@ Endpoint = ${WG_HOST}:${WG_PORT}`;
     });
   }
 
-  async createClient({ name }) {
+  async createClient({ name, allowedIps }) {
     if (!name) {
       throw new Error('Missing: Name');
     }
@@ -230,20 +239,30 @@ Endpoint = ${WG_HOST}:${WG_PORT}`;
     const publicKey = await Util.exec(`echo ${privateKey} | wg pubkey`);
     const preSharedKey = await Util.exec('wg genpsk');
 
-    // Calculate next IP
-    let address;
-    for (let i = 2; i < 255; i++) {
-      const client = Object.values(config.clients).find(client => {
-        return client.address === WG_DEFAULT_ADDRESS.replace('x', i);
-      });
+    let finalAllowedIps;
+    if (allowedIps) {
+      let interfaceAddress = this.getInterfaceAddress(allowedIps);
 
-      if (!client) {
-        address = WG_DEFAULT_ADDRESS.replace('x', i);
-        break;
+      if (!interfaceAddress) {
+        throw new Error('Client needs to have at least one Allowed IP in the server\'s virtual subnet');
+      }
+
+      if (!allowedIps.split(',').every(address => this.isAddressAvailable(address, config.clients))) {
+        throw new Error('One or more addresses are already in use');
+      }
+
+      finalAllowedIps = allowedIps
+    } else {
+      // Calculate next IP
+      for (let i = 2; i < 255; i++) {
+        if (await this.isAddressAvailable(`${WG_DEFAULT_ADDRESS.replace('x', i)}/32`, config.clients)) {
+          finalAllowedIps = `${WG_DEFAULT_ADDRESS.replace('x', i)}/32`;
+          break;
+        }
       }
     }
 
-    if (!address) {
+    if (!finalAllowedIps) {
       throw new Error('Maximum number of clients reached.');
     }
 
@@ -251,7 +270,7 @@ Endpoint = ${WG_HOST}:${WG_PORT}`;
     const clientId = uuid.v4();
     const client = {
       name,
-      address,
+      allowedIps: finalAllowedIps,
       privateKey,
       publicKey,
       preSharedKey,
@@ -305,17 +324,58 @@ Endpoint = ${WG_HOST}:${WG_PORT}`;
     await this.saveConfig();
   }
 
-  async updateClientAddress({ clientId, address }) {
+  async updateClientAllowedIps({ clientId, allowedIps }) {
+    const config = await this.getConfig();
     const client = await this.getClient({ clientId });
+    const addresses = allowedIps.split(',')
 
-    if (!Util.isValidIPv4(address)) {
-      throw new ServerError(`Invalid Address: ${address}`, 400);
+    for (const address of addresses) {
+      if (!Util.isValidIPv4(address.split('/')[0])) {
+        throw new ServerError(`Invalid Address: ${address}`, 400);
+      }
     }
 
-    client.address = address;
+    let interfaceAddress = this.getInterfaceAddress(allowedIps);
+
+    if (!interfaceAddress) {
+      throw new ServerError('Client needs to have at least one Allowed IP in the server\'s virtual subnet');
+    }
+
+    const otherClients = { ...config.clients};
+    delete otherClients[clientId];
+
+    if (!addresses.every(address => this.isAddressAvailable(address, otherClients))) {
+      throw new Error('One or more addresses are already in use');
+    }
+
+    client.allowedIps = addresses.join(',');
     client.updatedAt = new Date();
 
     await this.saveConfig();
   }
 
+  isAddressAvailable(address, clients) {
+    return Object.values(clients).every(client => {
+      return !client.allowedIps.includes(address);
+    });
+  };
+
+  getInterfaceAddress(allowedIps) {
+    let interfaceAddress;
+
+    for (const address of allowedIps.split(',')) {
+      if (this.isInterfaceAddress(address)) {
+        interfaceAddress = address;
+        break;
+      }
+    }
+
+    return interfaceAddress;
+  }
+
+  isInterfaceAddress(address) {
+    // We assume that the server's virtual subnet is a /24 since it's hardcoded in wg-easy
+    const addressBase = WG_DEFAULT_ADDRESS.split('.').slice(0, 3).join('.');
+    return address.includes('/32') && address.startsWith(addressBase);
+  }
 };
