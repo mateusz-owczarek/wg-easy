@@ -208,7 +208,7 @@ AllowedIPs = ${client.allowedIps}`;
     return `
 [Interface]
 PrivateKey = ${client.privateKey}
-Address = ${address}/24
+Address = ${address}
 ${WG_DEFAULT_DNS ? `DNS = ${WG_DEFAULT_DNS}` : ''}
 ${WG_MTU ? `MTU = ${WG_MTU}` : ''}
 
